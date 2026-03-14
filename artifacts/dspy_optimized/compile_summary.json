@@ -1,0 +1,9 @@
+{
+  "train_size": 8,
+  "dev_size": 2,
+  "baseline_score": 0.1564207650273224,
+  "optimized_score": 0.3710907704042715,
+  "compiler_model": "ollama_chat/llama3.1:8b",
+  "optimized_state_path": "artifacts/dspy_optimized/optimized_program.json",
+  "optimized_prompt_path": "artifacts/dspy_optimized/optimized_prompt.json"
+}

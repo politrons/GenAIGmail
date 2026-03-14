@@ -1,0 +1,10 @@
+{"question":"How do I find the latest renewal email from ACME?","answer":"Search by sender and keyword, then return the newest message with sender, subject, date, and a short snippet."}
+{"question":"What should I answer if no email matches invoice INV-1042?","answer":"State that there is no evidence and recommend a wider search using sender, date range, and alternate invoice identifiers."}
+{"question":"How should a summary mention evidence?","answer":"Include concrete references: sender, subject, date, and a direct snippet from retrieved emails."}
+{"question":"Can I report exact counts for a query?","answer":"Yes, but only if the indexed emails contain matches. Report the count and mention the search tokens used."}
+{"question":"What is the safest behavior when evidence is weak?","answer":"Say evidence is insufficient, avoid assumptions, and propose the next precise filter or mailbox query."}
+{"question":"How do I report unanswered customer threads?","answer":"Identify emails that request action, group by sender or thread topic, and provide latest date and subject for each."}
+{"question":"How should date information be presented?","answer":"Use the email date from metadata and keep format consistent so users can verify each cited message."}
+{"question":"What if two emails conflict?","answer":"Cite both emails with sender, subject, and date, and explain the conflict instead of forcing a single conclusion."}
+{"question":"How should search-oriented responses be structured?","answer":"Start with the direct result, then list evidence lines and finally optional next filters."}
+{"question":"What is the expected style for this assistant?","answer":"Concise, operational, and grounded in retrieved email snippets with no invented details."}
