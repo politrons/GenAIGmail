@@ -6,10 +6,6 @@ import sys
 
 MODULE_BY_COMMAND = {
     "run": "src.email_local_assistant.ask_email",
-    "optimize": "src.email_local_assistant.optimize_prompts",
-    "index-kb": "src.email_local_assistant.build_rag_index",
-    "sync-gmail": "src.email_local_assistant.gmail_sync",
-    "ask-email": "src.email_local_assistant.ask_email",
 }
 
 

@@ -12,6 +12,7 @@ from email.header import decode_header, make_header
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from typing import Any
 
 
 def _load_env_file(path: str = ".env") -> None:
@@ -210,58 +211,108 @@ def _raise_auth_error(user: str, exc: Exception) -> None:
     raise RuntimeError(f"Error autenticando en Gmail IMAP para {user}: {raw}") from exc
 
 
-def main() -> None:
-    """Sync Gmail messages from IMAP into a local JSONL chunk index."""
-    args = parse_args()
+def _load_jsonl_rows(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
 
-    gmail_user = (args.gmail_user or "").strip() or (
-        _env_value("GMAIL_USER", "gmail_user", "GAMAIL_USER", "gamail_user") or ""
+
+def _row_identity(row: dict[str, object]) -> str:
+    metadata = row.get("metadata")
+    if isinstance(metadata, dict):
+        message_id = str(metadata.get("message_id", "")).strip()
+        if message_id:
+            return message_id
+    chunk_id = str(row.get("chunk_id", "")).strip()
+    return chunk_id
+
+
+def _merge_rows(existing: list[dict[str, object]], new_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for row in existing + new_rows:
+        if not isinstance(row, dict):
+            continue
+        key = _row_identity(row)
+        if not key:
+            continue
+        merged[key] = row
+
+    out: list[dict[str, object]] = list(merged.values())
+    out.sort(
+        key=lambda row: str(
+            ((row.get("metadata") if isinstance(row.get("metadata"), dict) else {}) or {}).get("date", "")
+        ),
+        reverse=True,
     )
-    gmail_password = (args.gmail_password or "").strip() or (
-        _env_value("GMAIL_PASSWORD", "gmail_password", "GAMAIL_PASSWORD", "gamail_password") or ""
-    )
+    return out
 
-    if not gmail_user:
-        env_hint = ".env file not found in project root." if not Path(".env").exists() else "Check your .env variable names."
-        raise ValueError(
-            "Missing Gmail user. Set --gmail-user or GMAIL_USER (also accepted: gmail_user, GAMAIL_USER). "
-            + env_hint
-        )
-    if not gmail_password:
-        env_hint = ".env file not found in project root." if not Path(".env").exists() else "Check your .env variable names."
-        raise ValueError(
-            "Missing Gmail password. Set --gmail-password or GMAIL_PASSWORD (also accepted: gmail_password, GAMAIL_PASSWORD). "
-            + env_hint
-        )
-    if args.max_emails <= 0:
-        raise ValueError("--max-emails must be greater than 0")
-    if args.max_body_chars < 200:
-        raise ValueError("--max-body-chars must be at least 200")
 
-    search_tokens = shlex.split(args.search_criterion)
+def sync_gmail_to_jsonl(
+    *,
+    gmail_user: str,
+    gmail_password: str,
+    imap_host: str,
+    imap_port: int,
+    mailbox: str,
+    search_criterion: str,
+    max_emails: int,
+    max_body_chars: int,
+    output_jsonl: str | Path,
+    include_html_fallback: bool = False,
+    offset: int = 0,
+    append: bool = False,
+) -> dict[str, Any]:
+    """Sync one paged window of Gmail emails into JSONL, optionally appending."""
+    user = (gmail_user or "").strip()
+    password = (gmail_password or "").strip()
+    if not user:
+        raise ValueError("Missing Gmail user. Set GMAIL_USER or --gmail-user.")
+    if not password:
+        raise ValueError("Missing Gmail password. Set GMAIL_PASSWORD or --gmail-password.")
+    if max_emails <= 0:
+        raise ValueError("max_emails must be greater than 0")
+    if max_body_chars < 200:
+        raise ValueError("max_body_chars must be at least 200")
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+
+    search_tokens = shlex.split(search_criterion or "ALL")
     if not search_tokens:
         search_tokens = ["ALL"]
 
-    client = imaplib.IMAP4_SSL(args.imap_host, args.imap_port)
+    client = imaplib.IMAP4_SSL(imap_host, imap_port)
     try:
         try:
-            login_status, _ = client.login(gmail_user, gmail_password)
+            login_status, _ = client.login(user, password)
         except imaplib.IMAP4.error as exc:
-            _raise_auth_error(gmail_user, exc)
+            _raise_auth_error(user, exc)
 
         if login_status != "OK":
             raise RuntimeError("Gmail login failed")
 
-        select_status, _ = client.select(args.mailbox)
+        select_status, _ = client.select(mailbox)
         if select_status != "OK":
-            raise RuntimeError(f"Could not select mailbox: {args.mailbox}")
+            raise RuntimeError(f"Could not select mailbox: {mailbox}")
 
         search_status, search_data = client.search(None, *search_tokens)
         if search_status != "OK":
-            raise RuntimeError(f"Search failed for criterion: {args.search_criterion}")
+            raise RuntimeError(f"Search failed for criterion: {search_criterion}")
 
         uid_list = search_data[0].split() if search_data else []
-        selected_uids = uid_list[-args.max_emails :]
+        total_matched = len(uid_list)
+        window_end = max(0, total_matched - offset)
+        window_start = max(0, window_end - max_emails)
+        selected_uids = uid_list[window_start:window_end]
 
         rows: list[dict[str, object]] = []
         sender_counts: Counter[str] = Counter()
@@ -289,15 +340,15 @@ def main() -> None:
             date_iso = _date_to_iso(raw_date)
             message_id = _decode_header_value(str(message.get("Message-ID", ""))) or f"uid-{uid}"
 
-            body = _extract_text_body(message, include_html_fallback=args.include_html_fallback)
-            if len(body) > args.max_body_chars:
-                body = body[: args.max_body_chars].rstrip() + "..."
+            body = _extract_text_body(message, include_html_fallback=include_html_fallback)
+            if len(body) > max_body_chars:
+                body = body[: max_body_chars].rstrip() + "..."
 
             snippet = body[:240]
             sender_counts[sender] += 1
 
             metadata = {
-                "mailbox": args.mailbox,
+                "mailbox": mailbox,
                 "uid": uid,
                 "message_id": message_id,
                 "from": sender,
@@ -310,33 +361,85 @@ def main() -> None:
 
             row = {
                 "chunk_id": f"gmail-{uid}",
-                "source": f"gmail:{args.mailbox}",
+                "source": f"gmail:{mailbox}",
                 "text": _build_text_blob(subject, sender, recipients, date_iso, body),
                 "metadata": metadata,
             }
             rows.append(row)
 
-        out_path = Path(args.output_jsonl)
+        out_path = Path(output_jsonl)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if append:
+            existing_rows = _load_jsonl_rows(out_path)
+            rows_to_write = _merge_rows(existing_rows, rows)
+        else:
+            rows_to_write = rows
+
         with out_path.open("w", encoding="utf-8") as f:
-            for row in rows:
+            for row in rows_to_write:
                 f.write(json.dumps(row, ensure_ascii=True) + "\n")
 
-        summary = {
-            "gmail_user": gmail_user,
-            "mailbox": args.mailbox,
-            "search_criterion": args.search_criterion,
-            "messages_matched": len(uid_list),
-            "messages_indexed": len(rows),
+        return {
+            "gmail_user": user,
+            "mailbox": mailbox,
+            "search_criterion": search_criterion,
+            "messages_matched": total_matched,
+            "messages_window_start": window_start,
+            "messages_window_end": window_end,
+            "messages_indexed_this_batch": len(rows),
+            "messages_indexed_total_file": len(rows_to_write),
             "output_jsonl": str(out_path),
+            "offset": offset,
+            "max_emails": max_emails,
+            "append": append,
             "top_senders": [{"sender": sender, "count": count} for sender, count in sender_counts.most_common(5)],
         }
-        print(json.dumps(summary, indent=2))
     finally:
         try:
             client.logout()
         except Exception:
             pass
+
+
+def main() -> None:
+    """Sync Gmail messages from IMAP into a local JSONL chunk index."""
+    args = parse_args()
+
+    gmail_user = (args.gmail_user or "").strip() or (
+        _env_value("GMAIL_USER", "gmail_user", "GAMAIL_USER", "gamail_user") or ""
+    )
+    gmail_password = (args.gmail_password or "").strip() or (
+        _env_value("GMAIL_PASSWORD", "gmail_password", "GAMAIL_PASSWORD", "gamail_password") or ""
+    )
+
+    if not gmail_user:
+        env_hint = ".env file not found in project root." if not Path(".env").exists() else "Check your .env variable names."
+        raise ValueError(
+            "Missing Gmail user. Set --gmail-user or GMAIL_USER (also accepted: gmail_user, GAMAIL_USER). "
+            + env_hint
+        )
+    if not gmail_password:
+        env_hint = ".env file not found in project root." if not Path(".env").exists() else "Check your .env variable names."
+        raise ValueError(
+            "Missing Gmail password. Set --gmail-password or GMAIL_PASSWORD (also accepted: gmail_password, GAMAIL_PASSWORD). "
+            + env_hint
+        )
+    summary = sync_gmail_to_jsonl(
+        gmail_user=gmail_user,
+        gmail_password=gmail_password,
+        imap_host=str(args.imap_host),
+        imap_port=int(args.imap_port),
+        mailbox=str(args.mailbox),
+        search_criterion=str(args.search_criterion),
+        max_emails=int(args.max_emails),
+        max_body_chars=int(args.max_body_chars),
+        output_jsonl=str(args.output_jsonl),
+        include_html_fallback=bool(args.include_html_fallback),
+        offset=0,
+        append=False,
+    )
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

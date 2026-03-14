@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-_TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
+_TOKEN_RE = re.compile(r"\w+", flags=re.UNICODE)
 
 
 @dataclass(frozen=True)

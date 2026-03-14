@@ -66,6 +66,8 @@ Useful `.env` variables:
 - `GMAIL_MAILBOX` (default `INBOX`)
 - `GMAIL_SEARCH_CRITERION` (for example: `ALL`, `UNSEEN`, `SINCE 01-Mar-2026`)
 - `GMAIL_MAX_EMAILS`
+- `GMAIL_MAX_BODY_CHARS`
+- `GMAIL_IMAP_HOST` / `GMAIL_IMAP_PORT`
 - `LOCAL_HF_MODEL_ID`
 - `LOCAL_HF_TASK`
 - `LOCAL_SYSTEM_PROMPT_FILE` (default: `config/email_llm_system_prompt.txt`)
@@ -73,41 +75,15 @@ Useful `.env` variables:
 - `GMAIL_SMTP_HOST` / `GMAIL_SMTP_PORT` (default Gmail SMTP)
 - `GMAIL_SEND_FROM` (optional sender override)
 
+## Runner command
+
+Only one launcher runner is exposed:
+
+```bash
+python3 main.py run --
+```
+
 ## Recommended flow
-
-## 1) Sync Gmail to local index
-
-```bash
-python3 main.py sync-gmail -- \
-  --mailbox "INBOX" \
-  --search-criterion "ALL" \
-  --max-emails 300 \
-  --output-jsonl data/gmail_chunks.jsonl
-```
-
-Alternative with direct credentials:
-
-```bash
-python3 main.py sync-gmail -- \
-  --gmail-user "your_account@gmail.com" \
-  --gmail-password "your_app_password_16_chars" \
-  --mailbox "INBOX" \
-  --search-criterion "ALL" \
-  --max-emails 300 \
-  --output-jsonl data/gmail_chunks.jsonl
-```
-
-## 2) (Optional) Reindex knowledge base
-
-```bash
-python3 main.py index-kb -- \
-  --input-paths data/knowledge_base.md \
-  --output-jsonl data/knowledge_base_chunks.jsonl \
-  --max-chars 900 \
-  --overlap-chars 120
-```
-
-## 3) Run questions (single daily command)
 
 The query engine injects a system prompt policy from:
 `config/email_llm_system_prompt.txt`
@@ -124,29 +100,23 @@ Search pattern logic is also LLM-first:
 - The retrieval and answer flow follows that plan.
 - In chat mode, another LLM planner decides if the message is a search request or a send action.
 
-Single query:
+Start chat:
 
 ```bash
 python3 main.py run -- \
-  --question "How many emails mention Supersonic and what is the latest one?" \
   --email-chunks data/gmail_chunks.jsonl \
   --knowledge-chunks data/knowledge_base_chunks.jsonl \
-  --hf-model-id "google/flan-t5-base" \
-  --rag-top-k 6
+  --hf-model-id "Qwen/Qwen2.5-1.5B-Instruct" \
+  --rag-top-k 6 \
+  --sync-batch-size 250
 ```
 
-This is the primary daily command:
-- `python3 main.py run -- ...`
+Behavior in chat:
+- If `data/gmail_chunks.jsonl` does not exist (or is empty), it auto-syncs the first batch from Gmail.
+- Searches run over local JSONL chunks.
+- If a query returns no hits, it auto-syncs the next batch (`--sync-batch-size`, default 250) and retries once.
 - It auto-loads DSPy optimized prompts if present; otherwise it uses the built-in prompt.
-
-Interactive mode:
-
-```bash
-python3 main.py run -- \
-  --chat \
-  --email-chunks data/gmail_chunks.jsonl \
-  --knowledge-chunks data/knowledge_base_chunks.jsonl
-```
+- Recommended model for stronger instruction/JSON behavior: `Qwen/Qwen2.5-1.5B-Instruct`.
 
 Chat send flow example:
 
@@ -160,26 +130,14 @@ You can test without sending:
 
 ```bash
 python3 main.py run -- \
-  --chat \
   --send-dry-run \
   --email-chunks data/gmail_chunks.jsonl
-```
-
-Single-shot search + send top candidate:
-
-```bash
-python3 main.py run -- \
-  --question "Find latest email about Supersonic" \
-  --email-chunks data/gmail_chunks.jsonl \
-  --send-to "someone@example.com" \
-  --send-dry-run
 ```
 
 JSON output (useful for integrations):
 
 ```bash
 python3 main.py run -- \
-  --question "Summarize the 3 most recent Supersonic emails" \
   --email-chunks data/gmail_chunks.jsonl \
   --json-output
 ```
@@ -214,7 +172,7 @@ ollama pull llama3.1:8b
 ```
 
 ```bash
-python3 main.py optimize -- \
+python3 -m src.email_local_assistant.optimize_prompts -- \
   --dataset data/email_assistant_qa.jsonl \
   --domain-context-file config/email_domain_context.txt \
   --output-dir artifacts/dspy_optimized \

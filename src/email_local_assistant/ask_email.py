@@ -12,8 +12,9 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer, GenerationConfig, pipeline
 
+from .gmail_sync import sync_gmail_to_jsonl
 from .rag_retriever import TfidfRagRetriever
 
 try:
@@ -57,42 +58,53 @@ DEFAULT_SYSTEM_POLICY = (
 )
 
 QUERY_PLANNER_PROMPT = (
-    "You are a query planner for email analytics.\n"
-    "Given a user question, extract a strict JSON plan for retrieval.\n"
-    "Return ONLY valid JSON with this exact schema:\n"
-    "{\n"
-    '  "intent": "count_latest|latest_list|summary|open_qa",\n'
-    '  "topic_terms": ["term1","term2"],\n'
+    "You are a JSON API for email retrieval planning.\n"
+    "Return exactly one valid JSON object and nothing else.\n"
+    "Required keys and types:\n"
+    '{\n'
+    '  "intent": "open_qa",\n'
+    '  "topic_terms": [],\n'
     '  "must_match_all_terms": true,\n'
     '  "sender_contains": "",\n'
     '  "request_count": false,\n'
     '  "request_latest": false,\n'
     '  "max_results": 6,\n'
     '  "language": "en"\n'
-    "}\n"
+    '}\n'
     "Rules:\n"
-    "- If the user asks how many + latest, set intent=count_latest, request_count=true, request_latest=true.\n"
-    "- Put only meaningful topic terms, no generic words.\n"
+    "- intent must be one of: count_latest, latest_list, summary, open_qa.\n"
+    "- If user asks count + latest, use intent=count_latest and set both booleans true.\n"
+    "- If user asks latest/recent only, use intent=latest_list and request_latest=true.\n"
+    "- topic_terms must include only meaningful topic words; use [] when user asks global latest without topic.\n"
     "- If sender is requested, set sender_contains.\n"
-    "- Keep max_results in [3, 10]."
+    "- max_results must be an integer in [3, 10].\n"
+    "- Output must start with '{' and end with '}'.\n"
+    "Example valid output:\n"
+    '{"intent":"open_qa","topic_terms":[],"must_match_all_terms":true,"sender_contains":"","request_count":false,"request_latest":false,"max_results":6,"language":"en"}\n'
+    "- Do not output markdown, comments, options lists, or extra text."
 )
 
 CHAT_ACTION_PLANNER_PROMPT = (
-    "You are a chat action planner for an email assistant.\n"
-    "Given the user message and current session context, return ONLY valid JSON.\n"
-    "Schema:\n"
-    "{\n"
-    '  "action": "search|send_last|help|none",\n'
+    "You are a JSON API for chat action planning.\n"
+    "Return exactly one valid JSON object and nothing else.\n"
+    "Required keys and types:\n"
+    '{\n'
+    '  "action": "search",\n'
     '  "recipient_email": "",\n'
     '  "candidate_index": 1,\n'
     '  "email_subject": "",\n'
     '  "email_instruction": ""\n'
-    "}\n"
+    '}\n'
     "Rules:\n"
-    "- Use action=send_last only if user clearly asks to send/forward and gives a recipient.\n"
-    "- candidate_index is 1-based. Default 1.\n"
-    "- If recipient missing for send request, set action=help.\n"
-    "- For normal analytics/search questions, set action=search."
+    "- action must be one of: search, send_last, help, none.\n"
+    "- Use action=search for normal email lookup/analytics requests.\n"
+    "- Use action=send_last only if user asks to send/forward and includes recipient_email.\n"
+    "- If send/forward requested without recipient_email, use action=help and explain missing recipient.\n"
+    "- candidate_index must be >= 1.\n"
+    "- Output must start with '{' and end with '}'.\n"
+    "Example valid output:\n"
+    '{"action":"search","recipient_email":"","candidate_index":1,"email_subject":"","email_instruction":""}\n'
+    "- Do not output markdown, comments, options lists, or extra text."
 )
 
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -132,10 +144,17 @@ PLANNER_NOISE_TERMS = {
     "many",
     "what",
     "latest",
+    "last",
     "recent",
+    "newest",
     "most",
     "email",
     "emails",
+    "show",
+    "give",
+    "dame",
+    "muestrame",
+    "muéstrame",
     "mention",
     "mentions",
     "cuantos",
@@ -147,6 +166,18 @@ PLANNER_NOISE_TERMS = {
     "menciona",
     "mencionan",
     "reciente",
+    "recientes",
+    "recibido",
+    "recibida",
+    "received",
+    "ultimo",
+    "último",
+    "ultima",
+    "última",
+    "ultimos",
+    "últimos",
+    "ultimas",
+    "últimas",
     "mas",
     "más",
     "cual",
@@ -175,12 +206,22 @@ def _load_env_file(path: str = ".env") -> None:
             os.environ.setdefault(key, value)
 
 
+def _env_value(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        cleaned = value.strip()
+        if cleaned:
+            return cleaned
+    return default
+
+
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for one-shot and chat-based email assistant modes."""
+    """Parse CLI arguments for chat-based email assistant mode."""
     _load_env_file(".env")
 
-    parser = argparse.ArgumentParser(description="Ask questions about indexed Gmail data using a local model")
-    parser.add_argument("--question", default=None, help="Single question to answer. If omitted, interactive mode starts.")
+    parser = argparse.ArgumentParser(description="Chat about Gmail data using a local model and local index")
     parser.add_argument("--context", default="")
     parser.add_argument("--email-chunks", default=os.getenv("GMAIL_CHUNKS_PATH", "data/gmail_chunks.jsonl"))
     parser.add_argument(
@@ -198,7 +239,7 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("LOCAL_SYSTEM_PROMPT_FILE", "config/email_llm_system_prompt.txt"),
         help="Path to system prompt policy injected before user question.",
     )
-    parser.add_argument("--hf-model-id", default=os.getenv("LOCAL_HF_MODEL_ID", "google/flan-t5-base"))
+    parser.add_argument("--hf-model-id", default=os.getenv("LOCAL_HF_MODEL_ID", "Qwen/Qwen2.5-1.5B-Instruct"))
     parser.add_argument("--hf-task", default=os.getenv("LOCAL_HF_TASK", "text-generation"))
     parser.add_argument("--max-new-tokens", type=int, default=int(os.getenv("LOCAL_MAX_NEW_TOKENS", "220")))
     parser.add_argument("--temperature", type=float, default=float(os.getenv("LOCAL_TEMPERATURE", "0.0")))
@@ -212,7 +253,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--send-from", default=os.getenv("GMAIL_SEND_FROM", os.getenv("GMAIL_USER", "")))
     parser.add_argument("--send-to", default="", help="Optional recipient email to send top result after answering.")
     parser.add_argument("--send-dry-run", action="store_true", help="Do not send. Print what would be sent.")
-    parser.add_argument("--chat", action="store_true", help="Force chat mode even when --question is provided.")
+    parser.add_argument(
+        "--gmail-user",
+        default=_env_value("GMAIL_USER", "gmail_user", "GAMAIL_USER", "gamail_user", default=""),
+        help="Gmail account for IMAP sync",
+    )
+    parser.add_argument(
+        "--gmail-password",
+        default=_env_value("GMAIL_PASSWORD", "gmail_password", "GAMAIL_PASSWORD", "gamail_password", default=""),
+        help="Gmail app password for IMAP sync",
+    )
+    parser.add_argument("--imap-host", default=_env_value("GMAIL_IMAP_HOST", "gmail_imap_host", default="imap.gmail.com"))
+    parser.add_argument("--imap-port", type=int, default=int(_env_value("GMAIL_IMAP_PORT", "gmail_imap_port", default="993")))
+    parser.add_argument("--mailbox", default=_env_value("GMAIL_MAILBOX", "gmail_mailbox", default="INBOX"))
+    parser.add_argument(
+        "--search-criterion",
+        default=_env_value("GMAIL_SEARCH_CRITERION", "gmail_search_criterion", default="ALL"),
+        help='IMAP search expression, e.g. "ALL", "UNSEEN", "SINCE 01-Mar-2026"',
+    )
+    parser.add_argument(
+        "--sync-batch-size",
+        type=int,
+        default=int(_env_value("GMAIL_MAX_EMAILS", "gmail_max_emails", default="250")),
+        help="Batch size for each automatic Gmail sync page",
+    )
+    parser.add_argument(
+        "--sync-max-body-chars",
+        type=int,
+        default=int(_env_value("GMAIL_MAX_BODY_CHARS", "gmail_max_body_chars", default="5000")),
+        help="Max email body chars stored during automatic sync",
+    )
+    parser.add_argument("--sync-include-html-fallback", action="store_true")
     parser.add_argument("--json-output", action="store_true")
     return parser.parse_args()
 
@@ -295,8 +366,50 @@ def _load_rows(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _build_retriever_paths(args: argparse.Namespace) -> list[str]:
+    paths: list[str] = [str(Path(args.email_chunks))]
+    knowledge_chunks = str(args.knowledge_chunks or "").strip()
+    if knowledge_chunks:
+        kb_path = Path(knowledge_chunks)
+        if kb_path.exists():
+            paths.append(str(kb_path))
+    return paths
+
+
+def _sync_email_window(args: argparse.Namespace, *, offset: int, append: bool) -> dict[str, Any]:
+    summary = sync_gmail_to_jsonl(
+        gmail_user=str(args.gmail_user),
+        gmail_password=str(args.gmail_password),
+        imap_host=str(args.imap_host),
+        imap_port=int(args.imap_port),
+        mailbox=str(args.mailbox),
+        search_criterion=str(args.search_criterion),
+        max_emails=int(args.sync_batch_size),
+        max_body_chars=int(args.sync_max_body_chars),
+        output_jsonl=str(args.email_chunks),
+        include_html_fallback=bool(args.sync_include_html_fallback),
+        offset=offset,
+        append=append,
+    )
+    return summary
+
+
+def _load_retriever_and_rows(args: argparse.Namespace) -> tuple[TfidfRagRetriever, list[dict[str, Any]]]:
+    email_chunks_path = Path(args.email_chunks)
+    if not email_chunks_path.exists():
+        raise FileNotFoundError(f"Email chunks file not found: {email_chunks_path}")
+
+    rows = _load_rows(email_chunks_path)
+    if not rows:
+        raise RuntimeError(f"No email rows found in {email_chunks_path}")
+
+    retriever_paths = _build_retriever_paths(args)
+    retriever = TfidfRagRetriever.from_jsonl_paths(retriever_paths)
+    return retriever, rows
+
+
 def _extract_query_tokens(text: str) -> list[str]:
-    tokens = [tok.lower() for tok in re.findall(r"[a-zA-Z0-9_]+", text)]
+    tokens = [tok.lower() for tok in re.findall(r"\w+", text, flags=re.UNICODE)]
     out: list[str] = []
     for tok in tokens:
         if len(tok) <= 2:
@@ -380,71 +493,167 @@ def _extract_json_object(text: str) -> str | None:
     return None
 
 
-def _fallback_llm_plan(question: str) -> dict[str, Any]:
-    terms = _extract_focus_terms(question)[:5]
-    question_lower = question.lower()
-    request_count = any(token in question_lower for token in ("how many", "cuantos", "cuántos"))
-    request_latest = any(token in question_lower for token in ("latest", "recent", "reciente", "mas reciente", "más reciente"))
-    intent = "open_qa"
-    if request_count and request_latest:
-        intent = "count_latest"
-    elif request_latest:
-        intent = "latest_list"
-    elif any(token in question_lower for token in ("summarize", "resumen", "resume")):
-        intent = "summary"
-
-    return {
-        "intent": intent,
-        "topic_terms": terms,
-        "must_match_all_terms": True,
-        "sender_contains": "",
-        "request_count": request_count,
-        "request_latest": request_latest,
-        "max_results": 6,
-        "language": "en",
-    }
+def _try_parse_json_dict(raw: str) -> dict[str, Any] | None:
+    json_blob = _extract_json_object(raw)
+    if json_blob is None:
+        return None
+    try:
+        parsed = json.loads(json_blob)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
 
 
-def _normalize_llm_plan(plan: dict[str, Any], question: str) -> dict[str, Any]:
-    base = _fallback_llm_plan(question)
+def _repair_json_with_llm(generator: Any, schema_prompt: str, invalid_output: str, max_new_tokens: int) -> list[str]:
+    invalid = str(invalid_output).strip()
+    prompts = [
+        "\n".join(
+            [
+                "You are a JSON repair assistant.",
+                "Rewrite the invalid output as one valid JSON object that follows the schema and rules.",
+                "Return only JSON.",
+                "Output must start with '{' and end with '}'.",
+                "",
+                "Schema and rules:",
+                schema_prompt,
+                "",
+                "Invalid output:",
+                invalid,
+                "",
+                "Fixed JSON:",
+            ]
+        ),
+        "\n".join(
+            [
+                "Return EXACTLY one minified JSON object.",
+                "No prose. No markdown. No assignments with '='. No lists of options.",
+                "If a field is unknown, use safe defaults from the schema examples.",
+                "Your first character must be '{' and your last character must be '}'.",
+                "",
+                "Schema and rules:",
+                schema_prompt,
+                "",
+                "Invalid output to fix:",
+                invalid,
+                "",
+                "JSON:",
+            ]
+        ),
+    ]
+    out: list[str] = []
+    for prompt in prompts:
+        out.append(
+            _generate_answer(
+                generator=generator,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+            )
+        )
+    return out
 
+
+def _normalize_query_plan_with_schema_repair(
+    parsed: dict[str, Any],
+    *,
+    generator: Any,
+    max_new_tokens: int,
+) -> dict[str, Any]:
+    try:
+        return _normalize_llm_plan(parsed)
+    except ValueError as exc:
+        repaired_candidates = _repair_json_with_llm(
+            generator=generator,
+            schema_prompt=QUERY_PLANNER_PROMPT,
+            invalid_output=f"{json.dumps(parsed, ensure_ascii=True)}\nSchema error: {exc}",
+            max_new_tokens=max_new_tokens,
+        )
+        for repaired in repaired_candidates:
+            repaired_parsed = _try_parse_json_dict(repaired)
+            if repaired_parsed is None:
+                continue
+            try:
+                return _normalize_llm_plan(repaired_parsed)
+            except ValueError:
+                continue
+        raise RuntimeError(f"LLM planner JSON schema validation failed: {exc}") from exc
+
+
+def _normalize_chat_action_with_schema_repair(
+    parsed: dict[str, Any],
+    *,
+    generator: Any,
+    max_new_tokens: int,
+) -> dict[str, Any]:
+    try:
+        return _normalize_chat_action(parsed)
+    except ValueError as exc:
+        repaired_candidates = _repair_json_with_llm(
+            generator=generator,
+            schema_prompt=CHAT_ACTION_PLANNER_PROMPT,
+            invalid_output=f"{json.dumps(parsed, ensure_ascii=True)}\nSchema error: {exc}",
+            max_new_tokens=max_new_tokens,
+        )
+        for repaired in repaired_candidates:
+            repaired_parsed = _try_parse_json_dict(repaired)
+            if repaired_parsed is None:
+                continue
+            try:
+                return _normalize_chat_action(repaired_parsed)
+            except ValueError:
+                continue
+        raise RuntimeError(f"LLM chat planner JSON schema validation failed: {exc}") from exc
+
+
+def _normalize_llm_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(plan, dict):
-        return base
+        raise ValueError("Query plan must be a JSON object")
 
-    intent = str(plan.get("intent", base["intent"])).strip()
+    intent = str(plan.get("intent", "")).strip()
     if intent not in {"count_latest", "latest_list", "summary", "open_qa"}:
-        intent = base["intent"]
+        raise ValueError("Invalid or missing plan.intent")
 
-    raw_terms = plan.get("topic_terms", [])
+    raw_terms = plan.get("topic_terms")
+    if not isinstance(raw_terms, list):
+        raise ValueError("Invalid or missing plan.topic_terms")
     terms: list[str] = []
-    if isinstance(raw_terms, list):
-        for item in raw_terms:
-            term = str(item).strip().lower()
-            if not term:
-                continue
-            if term in STOPWORDS:
-                continue
-            if term in PLANNER_NOISE_TERMS:
-                continue
-            terms.append(term)
-    if not terms:
-        terms = _extract_focus_terms(question)[:5]
-    if not terms:
-        terms = list(base["topic_terms"])
+    for item in raw_terms:
+        term = str(item).strip().lower()
+        if not term:
+            continue
+        if term in STOPWORDS:
+            continue
+        if term in PLANNER_NOISE_TERMS:
+            continue
+        terms.append(term)
 
-    must_match_all = bool(plan.get("must_match_all_terms", True))
+    must_match_all_raw = plan.get("must_match_all_terms")
+    if not isinstance(must_match_all_raw, bool):
+        raise ValueError("Invalid or missing plan.must_match_all_terms")
+    must_match_all = must_match_all_raw
     sender_contains = str(plan.get("sender_contains", "")).strip().lower()
-    request_count = bool(plan.get("request_count", False))
-    request_latest = bool(plan.get("request_latest", False))
+    request_count_raw = plan.get("request_count")
+    if not isinstance(request_count_raw, bool):
+        raise ValueError("Invalid or missing plan.request_count")
+    request_count = request_count_raw
+    request_latest_raw = plan.get("request_latest")
+    if not isinstance(request_latest_raw, bool):
+        raise ValueError("Invalid or missing plan.request_latest")
+    request_latest = request_latest_raw
 
-    max_results_raw = plan.get("max_results", 6)
+    max_results_raw = plan.get("max_results")
     try:
         max_results = int(max_results_raw)
     except Exception:
-        max_results = 6
-    max_results = max(3, min(10, max_results))
+        raise ValueError("Invalid or missing plan.max_results") from None
+    if max_results < 3 or max_results > 10:
+        raise ValueError("plan.max_results must be in [3,10]")
 
-    language = str(plan.get("language", "en")).strip().lower() or "en"
+    language = str(plan.get("language", "")).strip().lower()
+    if not language:
+        raise ValueError("Invalid or missing plan.language")
 
     return {
         "intent": intent,
@@ -464,11 +673,7 @@ def _plan_query_with_llm(
     system_policy: str,
     generator: Any,
 ) -> dict[str, Any]:
-    """Ask the LLM to build a structured retrieval plan for the current question.
-
-    The plan is expected as strict JSON. If parsing fails, a deterministic fallback
-    plan is returned to keep runtime resilient.
-    """
+    """Ask the LLM to build a structured retrieval plan for the current question."""
     plan_prompt = "\n".join(
         [
             QUERY_PLANNER_PROMPT,
@@ -488,16 +693,27 @@ def _plan_query_with_llm(
         max_new_tokens=220,
         temperature=0.0,
     )
-    json_blob = _extract_json_object(raw_plan)
-    if json_blob is None:
-        return _fallback_llm_plan(question)
+    parsed = _try_parse_json_dict(raw_plan)
+    if parsed is None:
+        repaired_candidates = _repair_json_with_llm(
+            generator=generator,
+            schema_prompt=QUERY_PLANNER_PROMPT,
+            invalid_output=raw_plan,
+            max_new_tokens=220,
+        )
+        for repaired in repaired_candidates:
+            parsed = _try_parse_json_dict(repaired)
+            if parsed is not None:
+                break
+        if parsed is None:
+            preview = str(repaired_candidates[-1]).strip().replace("\n", " ")[:260]
+            raise RuntimeError(f"LLM planner did not return valid JSON after repair. Raw output: {preview}")
 
-    try:
-        parsed = json.loads(json_blob)
-    except json.JSONDecodeError:
-        return _fallback_llm_plan(question)
-
-    return _normalize_llm_plan(parsed, question)
+    return _normalize_query_plan_with_schema_repair(
+        parsed,
+        generator=generator,
+        max_new_tokens=220,
+    )
 
 
 def _row_matches_plan(row: dict[str, Any], plan: dict[str, Any]) -> bool:
@@ -548,73 +764,51 @@ def _unique_sorted_email_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     return out
 
 
-def _extract_email_address(text: str) -> str:
-    match = EMAIL_REGEX.search(text or "")
-    return match.group(0) if match else ""
+def _rows_to_retrieval_chunks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        raw_meta = row.get("metadata")
+        metadata = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+        if not metadata.get("kind"):
+            metadata["kind"] = "email"
 
-
-def _fallback_chat_action(user_message: str) -> dict[str, Any]:
-    message = (user_message or "").strip()
-    lower = message.lower()
-    recipient = _extract_email_address(message)
-    wants_send = any(token in lower for token in ("send", "forward", "envia", "enviar", "manda", "reenviar"))
-    if wants_send:
-        if recipient:
-            return {
-                "action": "send_last",
-                "recipient_email": recipient,
-                "candidate_index": 1,
-                "email_subject": "",
-                "email_instruction": "",
+        chunks.append(
+            {
+                "chunk_id": str(row.get("chunk_id", f"latest-{idx + 1}")),
+                "source": str(row.get("source", "email_rows")),
+                "text": str(row.get("text", "")).strip(),
+                "score": max(0.0, 1.0 - (idx * 0.001)),
+                "metadata": metadata,
             }
-        return {
-            "action": "help",
-            "recipient_email": "",
-            "candidate_index": 1,
-            "email_subject": "",
-            "email_instruction": "Missing recipient email",
-        }
-
-    return {
-        "action": "search",
-        "recipient_email": "",
-        "candidate_index": 1,
-        "email_subject": "",
-        "email_instruction": "",
-    }
+        )
+    return chunks
 
 
-def _normalize_chat_action(plan: dict[str, Any], user_message: str) -> dict[str, Any]:
-    base = _fallback_chat_action(user_message)
+def _normalize_chat_action(plan: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(plan, dict):
-        return base
+        raise ValueError("Chat action must be a JSON object")
 
-    action = str(plan.get("action", base["action"])).strip().lower()
+    action = str(plan.get("action", "")).strip().lower()
     if action not in {"search", "send_last", "help", "none"}:
-        action = base["action"]
+        raise ValueError("Invalid or missing action")
 
-    recipient = str(plan.get("recipient_email", "")).strip()
+    recipient = str(plan.get("recipient_email", "")).strip().lower()
     if recipient and not EMAIL_REGEX.fullmatch(recipient):
-        extracted = _extract_email_address(recipient)
-        recipient = extracted
+        raise ValueError("recipient_email must be a valid email address")
 
     candidate_raw = plan.get("candidate_index", 1)
     try:
         candidate_index = int(candidate_raw)
     except Exception:
-        candidate_index = 1
-    candidate_index = max(1, candidate_index)
+        raise ValueError("candidate_index must be an integer") from None
+    if candidate_index < 1:
+        raise ValueError("candidate_index must be >= 1")
 
     email_subject = str(plan.get("email_subject", "")).strip()
     email_instruction = str(plan.get("email_instruction", "")).strip()
 
     if action == "send_last" and not recipient:
-        extracted = _extract_email_address(user_message)
-        if extracted:
-            recipient = extracted
-        else:
-            action = "help"
-            email_instruction = "Missing recipient email"
+        raise ValueError("action=send_last requires recipient_email")
 
     return {
         "action": action,
@@ -632,11 +826,7 @@ def _plan_chat_action_with_llm(
     last_result_preview: str,
     generator: Any,
 ) -> dict[str, Any]:
-    """Classify a chat turn into an assistant action using LLM JSON planning.
-
-    Expected actions are `search`, `send_last`, `help`, or `none`. Invalid JSON
-    responses are handled via a small fallback classifier.
-    """
+    """Classify a chat turn into an assistant action using LLM JSON planning."""
     prompt = "\n".join(
         [
             CHAT_ACTION_PLANNER_PROMPT,
@@ -658,14 +848,26 @@ def _plan_chat_action_with_llm(
         max_new_tokens=180,
         temperature=0.0,
     )
-    json_blob = _extract_json_object(raw)
-    if json_blob is None:
-        return _fallback_chat_action(user_message)
-    try:
-        parsed = json.loads(json_blob)
-    except json.JSONDecodeError:
-        return _fallback_chat_action(user_message)
-    return _normalize_chat_action(parsed, user_message)
+    parsed = _try_parse_json_dict(raw)
+    if parsed is None:
+        repaired_candidates = _repair_json_with_llm(
+            generator=generator,
+            schema_prompt=CHAT_ACTION_PLANNER_PROMPT,
+            invalid_output=raw,
+            max_new_tokens=180,
+        )
+        for repaired in repaired_candidates:
+            parsed = _try_parse_json_dict(repaired)
+            if parsed is not None:
+                break
+        if parsed is None:
+            preview = str(repaired_candidates[-1]).strip().replace("\n", " ")[:260]
+            raise RuntimeError(f"LLM chat planner did not return valid JSON after repair. Raw output: {preview}")
+    return _normalize_chat_action_with_schema_repair(
+        parsed,
+        generator=generator,
+        max_new_tokens=180,
+    )
 
 
 def _build_email_message_text(
@@ -807,64 +1009,6 @@ def _last_result_preview(result: dict[str, Any] | None) -> str:
     return f"answer={answer[:120]}"
 
 
-def _extract_focus_terms(question: str) -> list[str]:
-    lower_question = question.lower()
-
-    explicit_terms: list[str] = []
-    mention_match = re.search(r"\b(?:menciona|mencionan|mention|mentions)\s+([a-zA-Z0-9_.-]+)", lower_question)
-    if mention_match:
-        explicit_terms.append(mention_match.group(1).strip().lower())
-
-    quoted_terms: list[str] = []
-    for match in re.findall(r'"([^"]+)"|\'([^\']+)\'', question):
-        for candidate in match:
-            cleaned = candidate.strip().lower()
-            if cleaned:
-                quoted_terms.append(cleaned)
-
-    generic_intent_tokens = {
-        "cuantos",
-        "cuantas",
-        "correos",
-        "correo",
-        "emails",
-        "email",
-        "how",
-        "many",
-        "what",
-        "one",
-        "latest",
-        "most",
-        "recent",
-        "mention",
-        "mentions",
-        "the",
-        "and",
-        "menciona",
-        "mencionan",
-        "cual",
-        "mas",
-        "más",
-        "reciente",
-    }
-    token_terms = [t for t in _extract_query_tokens(question) if t not in generic_intent_tokens]
-
-    # If we already captured explicit topic terms (e.g. after "mention[s]"),
-    # avoid diluting matching with generic intent tokens from the whole question.
-    if explicit_terms:
-        token_terms = []
-
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for term in [*explicit_terms, *quoted_terms, *token_terms]:
-        normalized = term.strip().lower()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        ordered.append(normalized)
-    return ordered
-
-
 def _metadata_from_row(row: dict[str, Any]) -> dict[str, str]:
     raw_meta = row.get("metadata")
     if not isinstance(raw_meta, dict):
@@ -967,10 +1111,10 @@ def _normalize_task(task: str) -> str:
     return TASK_ALIASES.get(requested, requested)
 
 
-def _safe_model_max_input_tokens(tokenizer: Any, fallback: int = 2048) -> int:
+def _safe_model_max_input_tokens(tokenizer: Any, default_max_tokens: int = 2048) -> int:
     model_max = getattr(tokenizer, "model_max_length", None)
     if not isinstance(model_max, int) or model_max <= 0 or model_max > 100_000:
-        return fallback
+        return default_max_tokens
     return model_max
 
 
@@ -978,7 +1122,7 @@ def _build_generator(task: str, model_id: str):
     """Create a local text generator for either seq2seq or causal HF models.
 
     Seq2seq models (e.g. FLAN/T5) are loaded in a manual `generate()` path.
-    Causal models prefer transformers pipeline and fall back to manual loading.
+    Causal models use a transformers pipeline with the configured task.
     """
     if torch is None:
         raise RuntimeError("PyTorch is required for local generation. Install torch in your environment.")
@@ -1009,48 +1153,32 @@ def _build_generator(task: str, model_id: str):
         }
 
     try:
-        return pipeline(
+        pipe = pipeline(
             normalized_task,
             model=model_id,
             tokenizer=model_id,
             device=pipeline_device,
         )
+        model_obj = getattr(pipe, "model", None)
+        generation_config = getattr(model_obj, "generation_config", None)
+        if generation_config is not None:
+            # Avoid common warnings from instruct defaults when running deterministic generations.
+            if hasattr(generation_config, "do_sample"):
+                generation_config.do_sample = False
+            if hasattr(generation_config, "temperature"):
+                generation_config.temperature = 1.0
+            if hasattr(generation_config, "top_p"):
+                generation_config.top_p = 1.0
+            if hasattr(generation_config, "top_k"):
+                generation_config.top_k = 50
+            if hasattr(generation_config, "max_length"):
+                generation_config.max_length = None
+        return pipe
     except Exception as exc:
-        fallback_tasks: list[str] = []
-        if normalized_task != "text-generation":
-            fallback_tasks.append("text-generation")
-        if normalized_task != "text2text-generation":
-            fallback_tasks.append("text2text-generation")
-
-        for fallback_task in fallback_tasks:
-            try:
-                return pipeline(
-                    fallback_task,
-                    model=model_id,
-                    tokenizer=model_id,
-                    device=pipeline_device,
-                )
-            except Exception:
-                continue
-
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
-            model = AutoModelForCausalLM.from_pretrained(model_id)
-            if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
-                tokenizer.pad_token = tokenizer.eos_token
-            model.to(model_device)
-            model.eval()
-            return {
-                "engine": "causal-manual",
-                "model": model,
-                "tokenizer": tokenizer,
-                "device": model_device,
-            }
-        except Exception as manual_exc:
-            raise RuntimeError(
-                f"Could not build a local generator for task '{task}' and model '{model_id}'. "
-                "Try another --hf-model-id or a different --hf-task."
-            ) from manual_exc
+        raise RuntimeError(
+            f"Could not build a local generator for task '{task}' and model '{model_id}'. "
+            "Use a compatible local model/task combination."
+        ) from exc
 
 
 def _generate_answer(generator: Any, prompt: str, max_new_tokens: int, temperature: float) -> str:
@@ -1085,16 +1213,28 @@ def _generate_answer(generator: Any, prompt: str, max_new_tokens: int, temperatu
             output_ids = model.generate(**inputs, **generation_kwargs)
 
         text = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
-        if str(generator.get("engine")) == "causal-manual" and text.startswith(prompt):
-            text = text[len(prompt) :].strip()
         return text
 
-    generation_kwargs: dict[str, Any] = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": temperature > 0,
-    }
-    if temperature > 0:
-        generation_kwargs["temperature"] = temperature
+    generation_kwargs: dict[str, Any] = {}
+    model_obj = getattr(generator, "model", None)
+    base_cfg = getattr(model_obj, "generation_config", None)
+    if base_cfg is not None:
+        cfg = GenerationConfig.from_dict(base_cfg.to_dict())
+        cfg.max_new_tokens = max_new_tokens
+        cfg.max_length = None
+        cfg.do_sample = temperature > 0
+        if temperature > 0:
+            cfg.temperature = temperature
+        else:
+            cfg.temperature = 1.0
+            cfg.top_p = 1.0
+            cfg.top_k = 50
+        generation_kwargs["generation_config"] = cfg
+    else:
+        generation_kwargs["max_new_tokens"] = max_new_tokens
+        generation_kwargs["do_sample"] = temperature > 0
+        if temperature > 0:
+            generation_kwargs["temperature"] = temperature
 
     result = generator(prompt, **generation_kwargs)
 
@@ -1145,33 +1285,43 @@ def _run_single_question(
         generator=generator,
     )
 
-    topic_terms = llm_plan.get("topic_terms", [])
-    if isinstance(topic_terms, list) and topic_terms:
-        query_seed = " ".join([str(t) for t in topic_terms if str(t).strip()])
-    else:
-        query_seed = question
-    sender_filter = str(llm_plan.get("sender_contains", "")).strip()
-    if sender_filter:
-        query_seed = f"{query_seed} sender:{sender_filter}"
-
-    retrieval_query = query_seed if not context else f"{query_seed}\n{context}"
-    retrieval_candidates = retriever.retrieve(
-        query=retrieval_query,
-        top_k=max(args.rag_top_k * 4, args.rag_top_k),
-        min_score=args.rag_min_score,
+    plan_topic_terms = llm_plan.get("topic_terms", [])
+    topic_terms = (
+        [str(t).strip() for t in plan_topic_terms if str(t).strip()]
+        if isinstance(plan_topic_terms, list)
+        else []
     )
-
-    email_chunks = [c for c in retrieval_candidates if isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("kind") == "email"]
-    filtered_email_chunks = [c for c in email_chunks if _row_matches_plan(c, llm_plan)]
-    if filtered_email_chunks:
-        email_chunks = filtered_email_chunks
-
-    non_email_chunks = [
-        c for c in retrieval_candidates if not (isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("kind") == "email")
-    ]
-
+    sender_filter = str(llm_plan.get("sender_contains", "")).strip()
     selected_k = max(args.rag_top_k, int(llm_plan.get("max_results", args.rag_top_k)))
-    retrieved_chunks = (email_chunks + non_email_chunks)[: selected_k]
+    retrieval_query = question if not context else f"{question}\n{context}"
+
+    # For "latest" requests without a topic, TF-IDF has no reliable anchor terms.
+    # In that case, sort all matching emails by date and use those directly.
+    if bool(llm_plan.get("request_latest", False)) and not topic_terms:
+        latest_rows = _unique_sorted_email_rows([row for row in email_rows if _row_matches_plan(row, llm_plan)])
+        retrieved_chunks = _rows_to_retrieval_chunks(latest_rows[:selected_k])
+    else:
+        query_seed = " ".join(topic_terms) if topic_terms else question
+        if sender_filter:
+            query_seed = f"{query_seed} sender:{sender_filter}"
+
+        retrieval_query = query_seed if not context else f"{query_seed}\n{context}"
+        retrieval_candidates = retriever.retrieve(
+            query=retrieval_query,
+            top_k=max(args.rag_top_k * 4, args.rag_top_k),
+            min_score=args.rag_min_score,
+        )
+
+        email_chunks = [c for c in retrieval_candidates if isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("kind") == "email"]
+        filtered_email_chunks = [c for c in email_chunks if _row_matches_plan(c, llm_plan)]
+        if filtered_email_chunks:
+            email_chunks = filtered_email_chunks
+
+        non_email_chunks = [
+            c for c in retrieval_candidates if not (isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("kind") == "email")
+        ]
+
+        retrieved_chunks = (email_chunks + non_email_chunks)[: selected_k]
 
     corpus_stats = _email_stats(email_rows)
     matched_rows = [row for row in email_rows if _row_matches_plan(row, llm_plan)]
@@ -1234,21 +1384,11 @@ def _run_single_question(
 
 
 def main() -> None:
-    """Run the assistant entrypoint in one-shot mode or interactive chat mode."""
+    """Run the assistant entrypoint in interactive chat mode with auto-sync."""
     args = parse_args()
 
-    email_chunks_path = Path(args.email_chunks)
-    if not email_chunks_path.exists():
-        raise FileNotFoundError(
-            f"Email chunks file not found: {email_chunks_path}. Run `python3 main.py sync-gmail -- ...` first."
-        )
-
-    retriever_paths: list[str] = [str(email_chunks_path)]
-    knowledge_chunks = str(args.knowledge_chunks or "").strip()
-    if knowledge_chunks:
-        kb_path = Path(knowledge_chunks)
-        if kb_path.exists():
-            retriever_paths.append(str(kb_path))
+    if int(args.sync_batch_size) <= 0:
+        raise ValueError("--sync-batch-size must be greater than 0")
 
     prompt_artifact_path = _resolve_prompt_artifact_path(args.prompt_artifact)
     prompt_artifact, prompt_source = _load_prompt_artifact(prompt_artifact_path)
@@ -1257,48 +1397,24 @@ def main() -> None:
     else:
         print(f"[info] Using DSPy optimized prompt artifact: {prompt_source}")
     system_policy = _load_system_policy(args.system_prompt_file)
-    retriever = TfidfRagRetriever.from_jsonl_paths(retriever_paths)
     generator: Any = _build_generator(task=args.hf_task, model_id=args.hf_model_id)
 
-    email_rows = _load_rows(email_chunks_path)
-
-    interactive = bool(args.chat or args.question is None)
-    if not interactive:
-        user_question = str(args.question or "").strip()
-        if not user_question:
-            raise ValueError("Missing --question. Provide a question or run with --chat.")
-
-        result = _run_single_question(
-            question=user_question,
-            context=str(args.context),
-            system_policy=system_policy,
-            prompt_artifact=prompt_artifact,
-            retriever=retriever,
-            generator=generator,
-            email_rows=email_rows,
-            args=args,
+    initial_sync_summary: dict[str, Any] | None = None
+    email_chunks_path = Path(args.email_chunks)
+    existing_rows = _load_rows(email_chunks_path) if email_chunks_path.exists() else []
+    if not existing_rows:
+        initial_sync_summary = _sync_email_window(args, offset=0, append=False)
+        print(
+            f"[info] Downloaded initial email batch: "
+            f"{initial_sync_summary.get('messages_indexed_this_batch', 0)} messages"
         )
-        send_status = ""
-        recipient = str(args.send_to or "").strip()
-        if recipient:
-            send_status = _send_from_result(
-                result=result,
-                recipient=recipient,
-                candidate_index=1,
-                args=args,
-            )
 
-        if args.json_output:
-            payload: dict[str, Any] = {"result": result}
-            if send_status:
-                payload["send_status"] = send_status
-            print(json.dumps(payload, indent=2, ensure_ascii=True))
-            return
-
-        _print_result(result)
-        if send_status:
-            print(send_status)
-        return
+    retriever, email_rows = _load_retriever_and_rows(args)
+    loaded_messages = len(_unique_sorted_email_rows(email_rows))
+    next_sync_offset = loaded_messages
+    has_more_history = True
+    if initial_sync_summary is not None:
+        has_more_history = bool(initial_sync_summary.get("messages_window_start", 0) > 0)
 
     print("Chat mode. Ask about emails, then ask to send one (example: 'send that email to user@domain.com').")
     print("Type 'exit' to quit.")
@@ -1314,13 +1430,37 @@ def main() -> None:
         if user_message.lower() in {"exit", "quit"}:
             break
 
-        action_plan = _plan_chat_action_with_llm(
-            user_message=user_message,
-            system_policy=system_policy,
-            session_has_last_result=last_result is not None,
-            last_result_preview=_last_result_preview(last_result),
-            generator=generator,
-        )
+        try:
+            action_plan = _plan_chat_action_with_llm(
+                user_message=user_message,
+                system_policy=system_policy,
+                session_has_last_result=last_result is not None,
+                last_result_preview=_last_result_preview(last_result),
+                generator=generator,
+            )
+        except Exception as exc:
+            planner_error = f"Chat planner failed: {exc}"
+            if args.json_output:
+                print(
+                    json.dumps(
+                        {
+                            "warning": planner_error,
+                            "fallback_action": "search",
+                        },
+                        indent=2,
+                        ensure_ascii=True,
+                    )
+                )
+            else:
+                print(f"{planner_error}. Continuing as search.")
+                print("")
+            action_plan = {
+                "action": "search",
+                "recipient_email": "",
+                "candidate_index": 1,
+                "email_subject": "",
+                "email_instruction": "",
+            }
         action = str(action_plan.get("action", "search")).strip().lower()
 
         if action == "help":
@@ -1397,16 +1537,72 @@ def main() -> None:
                 print("")
             continue
 
-        result = _run_single_question(
-            question=user_message,
-            context=str(args.context),
-            system_policy=system_policy,
-            prompt_artifact=prompt_artifact,
-            retriever=retriever,
-            generator=generator,
-            email_rows=email_rows,
-            args=args,
-        )
+        try:
+            result = _run_single_question(
+                question=user_message,
+                context=str(args.context),
+                system_policy=system_policy,
+                prompt_artifact=prompt_artifact,
+                retriever=retriever,
+                generator=generator,
+                email_rows=email_rows,
+                args=args,
+            )
+        except Exception as exc:
+            query_error = f"Search failed: {exc}"
+            if args.json_output:
+                print(json.dumps({"action_plan": action_plan, "error": query_error}, indent=2, ensure_ascii=True))
+            else:
+                print(query_error)
+                print("")
+            continue
+
+        if int(result.get("query_hit_count", 0)) == 0 and has_more_history:
+            try:
+                sync_summary = _sync_email_window(args, offset=next_sync_offset, append=True)
+                fetched = int(sync_summary.get("messages_indexed_this_batch", 0))
+                has_more_history = bool(sync_summary.get("messages_window_start", 0) > 0)
+                next_sync_offset += int(args.sync_batch_size)
+
+                if fetched > 0:
+                    if args.json_output:
+                        print(
+                            json.dumps(
+                                {
+                                    "action_plan": action_plan,
+                                    "sync": {
+                                        "status": "fetched-next-batch",
+                                        "batch_size": fetched,
+                                        "offset": sync_summary.get("offset", 0),
+                                    },
+                                },
+                                indent=2,
+                                ensure_ascii=True,
+                            )
+                        )
+                    else:
+                        print(f"[info] No hits. Downloaded next batch of {fetched} emails and retrying.")
+                        print("")
+
+                    retriever, email_rows = _load_retriever_and_rows(args)
+                    result = _run_single_question(
+                        question=user_message,
+                        context=str(args.context),
+                        system_policy=system_policy,
+                        prompt_artifact=prompt_artifact,
+                        retriever=retriever,
+                        generator=generator,
+                        email_rows=email_rows,
+                        args=args,
+                    )
+            except Exception as exc:
+                sync_error = f"Auto-sync failed after zero hits: {exc}"
+                if args.json_output:
+                    print(json.dumps({"action_plan": action_plan, "warning": sync_error}, indent=2, ensure_ascii=True))
+                else:
+                    print(sync_error)
+                    print("")
+
         last_result = result
 
         if args.json_output:
