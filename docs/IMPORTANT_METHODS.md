@@ -20,7 +20,7 @@ This document explains the key methods in the local Gmail assistant and how they
 1. Build an LLM query plan.
 2. Build retrieval query from plan terms and context.
 3. Retrieve candidate chunks using TF-IDF (`TfidfRagRetriever`).
-4. Filter/re-rank email chunks according to the plan.
+4. Keep top retrieved chunks (no hardcoded business filtering/re-ranking in code).
 5. Build final grounded prompt (policy + plan + evidence + corpus stats).
 6. Generate final answer with local HF model.
 7. Return answer + evidence + send candidates for optional forwarding.

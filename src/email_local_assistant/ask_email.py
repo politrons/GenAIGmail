@@ -96,94 +96,32 @@ CHAT_ACTION_PLANNER_PROMPT = (
     '  "email_instruction": ""\n'
     '}\n'
     "Rules:\n"
-    "- action must be one of: search, send_last, help, none.\n"
+    "- action must be one of: search, send_last, compose_send, help, none.\n"
     "- Use action=search for normal email lookup/analytics requests.\n"
-    "- Use action=send_last only if user asks to send/forward and includes recipient_email.\n"
+    "- Use action=send_last to forward/share the previously found email result.\n"
+    "- Use action=compose_send to send a new email when user provides recipient and message/body content.\n"
     "- If send/forward requested without recipient_email, use action=help and explain missing recipient.\n"
+    "- Commands like 'send email to X', 'mail X', 'forward to X', or 'enviar correo a X' are send requests.\n"
+    "- If user includes 'subject ...' or 'with subject ...', map that to email_subject.\n"
+    "- If user includes 'body ...' or message content, map that to email_instruction.\n"
+    "- If command is explicit compose (to + subject/body), prefer compose_send even when Session has previous search result is false.\n"
+    "- If Session has previous search result is false and user asks to forward/share previous result, use action=help.\n"
+    "- Never use action=none for clear send or search requests.\n"
     "- candidate_index must be >= 1.\n"
     "- Output must start with '{' and end with '}'.\n"
     "Example valid output:\n"
     '{"action":"search","recipient_email":"","candidate_index":1,"email_subject":"","email_instruction":""}\n'
+    "Send examples:\n"
+    '- User: send email to politrons@gmail.com with subject "hello_agent" and body "Welcome to the agent world"\n'
+    '  Output: {"action":"compose_send","recipient_email":"politrons@gmail.com","candidate_index":1,"email_subject":"hello_agent","email_instruction":"Welcome to the agent world"}\n'
+    '- User: enviar correo a politrons@gmail.com con asunto "hola" y cuerpo "mensaje"\n'
+    '  Output: {"action":"compose_send","recipient_email":"politrons@gmail.com","candidate_index":1,"email_subject":"hola","email_instruction":"mensaje"}\n'
+    '- User: send this email to someone@example.com\n'
+    '  Output: {"action":"send_last","recipient_email":"someone@example.com","candidate_index":1,"email_subject":"","email_instruction":""}\n'
     "- Do not output markdown, comments, options lists, or extra text."
 )
 
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-STOPWORDS = {
-    "the",
-    "and",
-    "for",
-    "with",
-    "from",
-    "that",
-    "this",
-    "what",
-    "when",
-    "where",
-    "about",
-    "please",
-    "have",
-    "has",
-    "are",
-    "was",
-    "were",
-    "pero",
-    "para",
-    "sobre",
-    "quiero",
-    "como",
-    "donde",
-    "cuando",
-    "que",
-    "los",
-    "las",
-}
-
-PLANNER_NOISE_TERMS = {
-    "how",
-    "many",
-    "what",
-    "latest",
-    "last",
-    "recent",
-    "newest",
-    "most",
-    "email",
-    "emails",
-    "show",
-    "give",
-    "dame",
-    "muestrame",
-    "muéstrame",
-    "mention",
-    "mentions",
-    "cuantos",
-    "cuántos",
-    "cuantas",
-    "cuántas",
-    "correo",
-    "correos",
-    "menciona",
-    "mencionan",
-    "reciente",
-    "recientes",
-    "recibido",
-    "recibida",
-    "received",
-    "ultimo",
-    "último",
-    "ultima",
-    "última",
-    "ultimos",
-    "últimos",
-    "ultimas",
-    "últimas",
-    "mas",
-    "más",
-    "cual",
-    "cuál",
-}
-
 
 TASK_ALIASES = {
     "text2text-generation": "text-generation",
@@ -408,18 +346,6 @@ def _load_retriever_and_rows(args: argparse.Namespace) -> tuple[TfidfRagRetrieve
     return retriever, rows
 
 
-def _extract_query_tokens(text: str) -> list[str]:
-    tokens = [tok.lower() for tok in re.findall(r"\w+", text, flags=re.UNICODE)]
-    out: list[str] = []
-    for tok in tokens:
-        if len(tok) <= 2:
-            continue
-        if tok in STOPWORDS:
-            continue
-        out.append(tok)
-    return out
-
-
 def _email_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     sender_counts: Counter[str] = Counter()
     unique_message_ids: set[str] = set()
@@ -441,26 +367,6 @@ def _email_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "unique_messages": len(unique_message_ids) if unique_message_ids else len(rows),
         "top_senders": sender_counts.most_common(5),
     }
-
-
-def _query_hit_count(rows: list[dict[str, Any]], query: str) -> int:
-    tokens = _extract_query_tokens(query)
-    if not tokens:
-        return 0
-
-    hits: set[str] = set()
-    for row in rows:
-        text = str(row.get("text", "")).lower()
-        if not text:
-            continue
-        if any(token in text for token in tokens):
-            meta = row.get("metadata")
-            if isinstance(meta, dict):
-                message_id = str(meta.get("message_id", "")).strip()
-            else:
-                message_id = ""
-            hits.add(message_id or str(row.get("chunk_id", "")))
-    return len(hits)
 
 
 def _parse_email_date(raw: str) -> datetime:
@@ -618,16 +524,7 @@ def _normalize_llm_plan(plan: dict[str, Any]) -> dict[str, Any]:
     raw_terms = plan.get("topic_terms")
     if not isinstance(raw_terms, list):
         raise ValueError("Invalid or missing plan.topic_terms")
-    terms: list[str] = []
-    for item in raw_terms:
-        term = str(item).strip().lower()
-        if not term:
-            continue
-        if term in STOPWORDS:
-            continue
-        if term in PLANNER_NOISE_TERMS:
-            continue
-        terms.append(term)
+    terms = [str(item).strip().lower() for item in raw_terms if str(item).strip()]
 
     must_match_all_raw = plan.get("must_match_all_terms")
     if not isinstance(must_match_all_raw, bool):
@@ -716,34 +613,6 @@ def _plan_query_with_llm(
     )
 
 
-def _row_matches_plan(row: dict[str, Any], plan: dict[str, Any]) -> bool:
-    text = str(row.get("text", "")).lower()
-    if not text:
-        return False
-
-    terms = plan.get("topic_terms", [])
-    if not isinstance(terms, list):
-        terms = []
-    topic_terms = [str(t).strip().lower() for t in terms if str(t).strip()]
-
-    if topic_terms:
-        if bool(plan.get("must_match_all_terms", True)):
-            if not all(term in text for term in topic_terms):
-                return False
-        else:
-            if not any(term in text for term in topic_terms):
-                return False
-
-    sender_filter = str(plan.get("sender_contains", "")).strip().lower()
-    if sender_filter:
-        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        sender = str((meta or {}).get("from", "")).lower()
-        if sender_filter not in sender:
-            return False
-
-    return True
-
-
 def _unique_sorted_email_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     unique: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -764,32 +633,12 @@ def _unique_sorted_email_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     return out
 
 
-def _rows_to_retrieval_chunks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    chunks: list[dict[str, Any]] = []
-    for idx, row in enumerate(rows):
-        raw_meta = row.get("metadata")
-        metadata = dict(raw_meta) if isinstance(raw_meta, dict) else {}
-        if not metadata.get("kind"):
-            metadata["kind"] = "email"
-
-        chunks.append(
-            {
-                "chunk_id": str(row.get("chunk_id", f"latest-{idx + 1}")),
-                "source": str(row.get("source", "email_rows")),
-                "text": str(row.get("text", "")).strip(),
-                "score": max(0.0, 1.0 - (idx * 0.001)),
-                "metadata": metadata,
-            }
-        )
-    return chunks
-
-
 def _normalize_chat_action(plan: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(plan, dict):
         raise ValueError("Chat action must be a JSON object")
 
     action = str(plan.get("action", "")).strip().lower()
-    if action not in {"search", "send_last", "help", "none"}:
+    if action not in {"search", "send_last", "compose_send", "help", "none"}:
         raise ValueError("Invalid or missing action")
 
     recipient = str(plan.get("recipient_email", "")).strip().lower()
@@ -809,6 +658,10 @@ def _normalize_chat_action(plan: dict[str, Any]) -> dict[str, Any]:
 
     if action == "send_last" and not recipient:
         raise ValueError("action=send_last requires recipient_email")
+    if action == "compose_send" and not recipient:
+        raise ValueError("action=compose_send requires recipient_email")
+    if action == "compose_send" and not email_instruction:
+        raise ValueError("action=compose_send requires email_instruction")
 
     return {
         "action": action,
@@ -1270,8 +1123,8 @@ def _run_single_question(
 ) -> dict[str, Any]:
     """Execute the full retrieval + answer pipeline for one user question.
 
-    Flow: plan query with LLM -> retrieve chunks -> apply plan filters -> build
-    grounded prompt -> generate final answer -> return evidence and send candidates.
+    Flow: plan query with LLM -> retrieve chunks -> build grounded prompt ->
+    generate final answer -> return evidence and send candidates.
     """
     if retriever is None:
         raise RuntimeError("Retriever is not initialized")
@@ -1286,48 +1139,30 @@ def _run_single_question(
     )
 
     plan_topic_terms = llm_plan.get("topic_terms", [])
-    topic_terms = (
-        [str(t).strip() for t in plan_topic_terms if str(t).strip()]
-        if isinstance(plan_topic_terms, list)
-        else []
-    )
+    topic_terms = [str(t).strip() for t in plan_topic_terms if str(t).strip()] if isinstance(plan_topic_terms, list) else []
     sender_filter = str(llm_plan.get("sender_contains", "")).strip()
     selected_k = max(args.rag_top_k, int(llm_plan.get("max_results", args.rag_top_k)))
-    retrieval_query = question if not context else f"{question}\n{context}"
-
-    # For "latest" requests without a topic, TF-IDF has no reliable anchor terms.
-    # In that case, sort all matching emails by date and use those directly.
-    if bool(llm_plan.get("request_latest", False)) and not topic_terms:
-        latest_rows = _unique_sorted_email_rows([row for row in email_rows if _row_matches_plan(row, llm_plan)])
-        retrieved_chunks = _rows_to_retrieval_chunks(latest_rows[:selected_k])
-    else:
-        query_seed = " ".join(topic_terms) if topic_terms else question
-        if sender_filter:
-            query_seed = f"{query_seed} sender:{sender_filter}"
-
-        retrieval_query = query_seed if not context else f"{query_seed}\n{context}"
-        retrieval_candidates = retriever.retrieve(
-            query=retrieval_query,
-            top_k=max(args.rag_top_k * 4, args.rag_top_k),
-            min_score=args.rag_min_score,
-        )
-
-        email_chunks = [c for c in retrieval_candidates if isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("kind") == "email"]
-        filtered_email_chunks = [c for c in email_chunks if _row_matches_plan(c, llm_plan)]
-        if filtered_email_chunks:
-            email_chunks = filtered_email_chunks
-
-        non_email_chunks = [
-            c for c in retrieval_candidates if not (isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("kind") == "email")
-        ]
-
-        retrieved_chunks = (email_chunks + non_email_chunks)[: selected_k]
+    query_seed = " ".join(topic_terms) if topic_terms else question
+    if sender_filter:
+        query_seed = f"{query_seed} sender:{sender_filter}"
+    retrieval_query = query_seed if not context else f"{query_seed}\n{context}"
+    retrieval_candidates = retriever.retrieve(
+        query=retrieval_query,
+        top_k=max(args.rag_top_k * 4, selected_k),
+        min_score=args.rag_min_score,
+    )
+    retrieved_chunks = retrieval_candidates[:selected_k]
 
     corpus_stats = _email_stats(email_rows)
-    matched_rows = [row for row in email_rows if _row_matches_plan(row, llm_plan)]
-    hit_count = len(_unique_sorted_email_rows(matched_rows))
-    if hit_count == 0:
-        hit_count = _query_hit_count(email_rows, retrieval_query)
+    unique_email_hits: set[str] = set()
+    for chunk in retrieved_chunks:
+        metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+        if metadata.get("kind") != "email":
+            continue
+        key = str(metadata.get("message_id", "")).strip() or str(chunk.get("chunk_id", "")).strip()
+        if key:
+            unique_email_hits.add(key)
+    hit_count = len(unique_email_hits)
 
     prompt = _build_prompt(
         system_policy=system_policy,
@@ -1430,6 +1265,9 @@ def main() -> None:
         if user_message.lower() in {"exit", "quit"}:
             break
 
+        if not args.json_output:
+            print(f"{args.hf_model_id} Thinking.....")
+
         try:
             action_plan = _plan_chat_action_with_llm(
                 user_message=user_message,
@@ -1468,7 +1306,8 @@ def main() -> None:
                 "Ask any search question, then ask to send the last found email.\n"
                 "Examples:\n"
                 "- find latest email about Supersonic\n"
-                "- send this email to someone@example.com"
+                "- send this email to someone@example.com\n"
+                "- send email to someone@example.com with subject \"hello\" and body \"message\""
             )
             if args.json_output:
                 print(json.dumps({"action_plan": action_plan, "message": help_text}, indent=2, ensure_ascii=True))
@@ -1511,6 +1350,56 @@ def main() -> None:
                     args=args,
                     instruction=str(action_plan.get("email_instruction", "")),
                     subject_override=str(action_plan.get("email_subject", "")),
+                )
+            except Exception as exc:
+                error_message = f"Send failed: {exc}"
+                if args.json_output:
+                    print(json.dumps({"action_plan": action_plan, "error": error_message}, indent=2, ensure_ascii=True))
+                else:
+                    print(error_message)
+                    print("")
+                continue
+
+            if args.json_output:
+                print(json.dumps({"action_plan": action_plan, "send_status": send_status}, indent=2, ensure_ascii=True))
+            else:
+                print(send_status)
+                print("")
+            continue
+
+        if action == "compose_send":
+            recipient = str(action_plan.get("recipient_email", "")).strip() or str(args.send_to or "").strip()
+            if not recipient:
+                message = "Missing recipient email. Say: send email to user@domain.com with subject \"...\" and body \"...\""
+                if args.json_output:
+                    print(json.dumps({"action_plan": action_plan, "error": message}, indent=2, ensure_ascii=True))
+                else:
+                    print(message)
+                    print("")
+                continue
+
+            body = str(action_plan.get("email_instruction", "")).strip()
+            if not body:
+                message = "Missing email body. Add body/content in your command."
+                if args.json_output:
+                    print(json.dumps({"action_plan": action_plan, "error": message}, indent=2, ensure_ascii=True))
+                else:
+                    print(message)
+                    print("")
+                continue
+
+            subject = str(action_plan.get("email_subject", "")).strip() or "Message from Local Gmail Assistant"
+            try:
+                send_status = _send_email_via_smtp(
+                    smtp_host=args.smtp_host,
+                    smtp_port=args.smtp_port,
+                    smtp_user=str(args.smtp_user).strip(),
+                    smtp_password=str(args.smtp_password).strip(),
+                    send_from=str(args.send_from).strip(),
+                    send_to=recipient,
+                    subject=subject,
+                    body=body,
+                    dry_run=bool(args.send_dry_run),
                 )
             except Exception as exc:
                 error_message = f"Send failed: {exc}"

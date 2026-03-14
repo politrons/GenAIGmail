@@ -28,7 +28,6 @@ Primary path for this project:
 
 ## Data status
 
-The project no longer uses legacy SaaS datasets/prompts.
 `data/` is email-focused:
 - `data/gmail_chunks.jsonl` (output from Gmail sync)
 - `data/email_assistant_qa.jsonl` (email DSPy dataset)
@@ -97,7 +96,7 @@ Prompt logic is automatic:
 
 Search pattern logic is also LLM-first:
 - The model builds a JSON retrieval plan (intent, topic terms, sender filters, latest/count flags).
-- The retrieval and answer flow follows that plan.
+- The retrieval query is derived from that plan, and there are no hardcoded business filters/re-ranking rules in code.
 - In chat mode, another LLM planner decides if the message is a search request or a send action.
 
 Start chat:
