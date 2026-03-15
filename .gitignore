@@ -1,0 +1,38 @@
+# =========================
+# Sensitive credentials
+# =========================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# =========================
+# Sensitive/local email data
+# =========================
+data/gmail_chunks.jsonl
+
+# Optional private local exports (future-proof)
+data/*private*.jsonl
+data/*secret*.jsonl
+
+# =========================
+# Local optimization artifacts (can include private prompt context)
+# =========================
+artifacts/dspy_optimized/
+artifacts/**/optimized_prompt.json
+artifacts/**/optimized_program.json
+artifacts/**/compile_summary.json
+
+# =========================
+# Local caches and IDE files
+# =========================
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+.DS_Store
+.idea/
+.vscode/
