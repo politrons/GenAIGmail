@@ -5,8 +5,8 @@ This document explains the key methods in the local Gmail assistant and how they
 ## 1) Query and chat engine (`src/email_local_assistant/ask_email.py`)
 
 ### `parse_args()`
-- Loads `.env` automatically and builds CLI options for chat mode, local model settings, SMTP send controls, and IMAP auto-sync controls.
-- Main groups: `--email-chunks`/`--knowledge-chunks`, `--prompt-artifact`/`--system-prompt-file`, `--hf-model-id`/`--hf-task`, SMTP flags, and sync flags (`--sync-batch-size`, IMAP credentials, mailbox/search criterion).
+- Loads `.env` automatically and builds CLI options for chat mode, local model settings, send controls, and MCP transport controls.
+- Main groups: `--email-chunks`/`--knowledge-chunks`, `--prompt-artifact`/`--system-prompt-file`, `--hf-model-id`/`--hf-task`, send flags, sync flags, and MCP flags (`--mcp-server-command`, `--mcp-search-tool`, `--mcp-send-tool`, `--mcp-account`, timeouts).
 
 ### `_plan_query_with_llm(question, context, system_policy, generator)`
 - First LLM planning stage.
@@ -26,19 +26,20 @@ This document explains the key methods in the local Gmail assistant and how they
 7. Return answer + evidence + send candidates for optional forwarding.
 
 ### `_sync_email_window(args, offset, append)` and `_load_retriever_and_rows(args)`
-- `_sync_email_window(...)` delegates to Gmail IMAP sync and supports pagination via `offset` and batch size.
+- `_sync_email_window(...)` delegates to MCP Gmail sync (`sync_gmail_via_mcp`).
+- Supports pagination via `offset` and batch size.
 - `_load_retriever_and_rows(...)` rebuilds the retriever from local JSONL after each sync page.
 
 ### `_plan_chat_action_with_llm(user_message, ...)`
 - Second LLM planning stage used in interactive chat mode.
-- Returns JSON action: `search`, `send_last`, `help`, or `none`.
+- Returns JSON action: `search`, `send_last`, `compose_send`, `help`, or `none`.
 - If JSON is invalid, it performs one LLM-based JSON repair pass.
 - If still invalid or schema-incompatible after repair, it raises an explicit runtime error.
 
 ### `_send_from_result(result, recipient, candidate_index, args, ...)`
 - Builds outbound email payload from the last search result.
-- Selects candidate email snippet, composes body, and sends via SMTP.
-- Uses `_send_email_via_smtp(...)`.
+- Selects candidate email snippet and composes body.
+- Sends through MCP (`send_email_via_mcp`) via `_send_email_via_transport(...)`.
 - If `--send-dry-run` is enabled, no network send is performed.
 
 ### `_build_generator(task, model_id)` and `_generate_answer(...)`
@@ -52,21 +53,25 @@ This document explains the key methods in the local Gmail assistant and how they
 - During chat search, if no query hits are found, it automatically syncs the next batch (for example next 250) and retries once.
 - Keeps state (`last_result`) and lets LLM decide per message if it is search or send.
 
-## 2) Gmail sync (`src/email_local_assistant/gmail_sync.py`)
+## 2) MCP Gmail transport (`src/email_local_assistant/mcp_gmail.py`)
 
-### `parse_args()`
-- Reads CLI + `.env` and supports multiple env aliases for Gmail credentials.
+### `_StdioMcpClient`
+- Minimal MCP stdio JSON-RPC client (`initialize`, `notifications/initialized`, `tools/call`).
+- Launches MCP server command and auto-negotiates stdio framing:
+  - `Content-Length` framed JSON-RPC
+  - NDJSON (one JSON message per line)
 
-### `_extract_text_body(message, include_html_fallback)`
-- Extracts readable text from MIME emails.
-- Prefers `text/plain`, optionally falls back to stripped `text/html`.
-- Skips attachments.
+### `sync_gmail_via_mcp(...)`
+- Calls MCP search tool (default `searchGmail`).
+- Normalizes returned messages to the same local JSONL email schema used by RAG.
+- Supports local paging (`offset`) and append merge behavior.
+- Supports optional MCP account injection (`mcp_account`) for servers that require explicit account selection.
 
-### `main()`
-- Connects to Gmail IMAP.
-- Searches with provided IMAP criterion.
-- Fetches messages, normalizes metadata and body.
-- Writes local JSONL chunks (`data/gmail_chunks.jsonl` by default).
+### `send_email_via_mcp(...)`
+- Calls MCP send tool (default `sendGmailDraft`) for outgoing email.
+- If configured tool is `sendGmailDraft`, it performs draft flow:
+  - `createGmailDraft` (with recipient/subject/body)
+  - `sendGmailDraft` (with extracted `draftId`)
 
 ## 3) Local retriever (`src/email_local_assistant/rag_retriever.py`)
 
@@ -93,12 +98,12 @@ This document explains the key methods in the local Gmail assistant and how they
 ## 5) Runtime flow summary
 
 1. `run` starts chat mode and loads policy/model.
-2. If local email chunks are missing, it syncs first IMAP batch.
+2. If local email chunks are missing, it syncs first batch via MCP.
 3. LLM creates retrieval plan.
 4. TF-IDF retriever returns evidence from local chunks.
-5. If there are no hits, app syncs next IMAP batch and retries search.
+5. If there are no hits, app syncs next batch and retries search.
 6. LLM produces grounded answer.
-7. In chat mode, LLM can route next user turn to `send_last`.
+7. In chat mode, LLM can route next user turn to `send_last` or `compose_send`.
 
 ## 6) Runtime strictness
 

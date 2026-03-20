@@ -1,1 +1,1 @@
-"""Local email assistant stack: DSPy prompt optimization + Gmail + local HF inference."""
+"""Local email assistant stack: DSPy prompt optimization + MCP Gmail + local HF inference."""

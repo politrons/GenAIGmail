@@ -4,17 +4,15 @@ import argparse
 import json
 import os
 import re
-import smtplib
 import sys
 from collections import Counter
 from datetime import datetime
-from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
 from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer, GenerationConfig, pipeline
 
-from .gmail_sync import sync_gmail_to_jsonl
+from .mcp_gmail import send_email_via_mcp, sync_gmail_via_mcp
 from .rag_retriever import TfidfRagRetriever
 
 try:
@@ -127,6 +125,8 @@ TASK_ALIASES = {
     "text2text-generation": "text-generation",
 }
 
+DEFAULT_MCP_SERVER_COMMAND = "npx -y google-workspace-mcp serve"
+
 
 def _load_env_file(path: str = ".env") -> None:
     env_path = Path(path)
@@ -184,30 +184,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rag-top-k", type=int, default=int(os.getenv("LOCAL_RAG_TOP_K", "6")))
     parser.add_argument("--rag-min-score", type=float, default=float(os.getenv("LOCAL_RAG_MIN_SCORE", "0.01")))
     parser.add_argument("--max-snippet-chars", type=int, default=int(os.getenv("LOCAL_MAX_SNIPPET_CHARS", "420")))
-    parser.add_argument("--smtp-host", default=os.getenv("GMAIL_SMTP_HOST", "smtp.gmail.com"))
-    parser.add_argument("--smtp-port", type=int, default=int(os.getenv("GMAIL_SMTP_PORT", "465")))
-    parser.add_argument("--smtp-user", default=os.getenv("SMTP_USER", os.getenv("GMAIL_USER", "")))
-    parser.add_argument("--smtp-password", default=os.getenv("SMTP_PASSWORD", os.getenv("GMAIL_PASSWORD", "")))
-    parser.add_argument("--send-from", default=os.getenv("GMAIL_SEND_FROM", os.getenv("GMAIL_USER", "")))
     parser.add_argument("--send-to", default="", help="Optional recipient email to send top result after answering.")
     parser.add_argument("--send-dry-run", action="store_true", help="Do not send. Print what would be sent.")
-    parser.add_argument(
-        "--gmail-user",
-        default=_env_value("GMAIL_USER", "gmail_user", "GAMAIL_USER", "gamail_user", default=""),
-        help="Gmail account for IMAP sync",
-    )
-    parser.add_argument(
-        "--gmail-password",
-        default=_env_value("GMAIL_PASSWORD", "gmail_password", "GAMAIL_PASSWORD", "gamail_password", default=""),
-        help="Gmail app password for IMAP sync",
-    )
-    parser.add_argument("--imap-host", default=_env_value("GMAIL_IMAP_HOST", "gmail_imap_host", default="imap.gmail.com"))
-    parser.add_argument("--imap-port", type=int, default=int(_env_value("GMAIL_IMAP_PORT", "gmail_imap_port", default="993")))
     parser.add_argument("--mailbox", default=_env_value("GMAIL_MAILBOX", "gmail_mailbox", default="INBOX"))
     parser.add_argument(
         "--search-criterion",
         default=_env_value("GMAIL_SEARCH_CRITERION", "gmail_search_criterion", default="ALL"),
-        help='IMAP search expression, e.g. "ALL", "UNSEEN", "SINCE 01-Mar-2026"',
+        help='Search expression/query passed to MCP search tool',
     )
     parser.add_argument(
         "--sync-batch-size",
@@ -221,7 +204,38 @@ def parse_args() -> argparse.Namespace:
         default=int(_env_value("GMAIL_MAX_BODY_CHARS", "gmail_max_body_chars", default="5000")),
         help="Max email body chars stored during automatic sync",
     )
-    parser.add_argument("--sync-include-html-fallback", action="store_true")
+    parser.add_argument(
+        "--mcp-server-command",
+        default=_env_value("MCP_SERVER_COMMAND", "mcp_server_command", default=DEFAULT_MCP_SERVER_COMMAND),
+        help='Command used to launch MCP server, e.g. \'npx -y google-workspace-mcp serve\'',
+    )
+    parser.add_argument(
+        "--mcp-search-tool",
+        default=_env_value("MCP_GMAIL_SEARCH_TOOL", "mcp_gmail_search_tool", default="searchGmail"),
+        help="MCP tool name for email search",
+    )
+    parser.add_argument(
+        "--mcp-send-tool",
+        default=_env_value("MCP_GMAIL_SEND_TOOL", "mcp_gmail_send_tool", default="sendGmailDraft"),
+        help="MCP tool name for email send",
+    )
+    parser.add_argument(
+        "--mcp-account",
+        default=_env_value("MCP_GMAIL_ACCOUNT", "mcp_gmail_account", default=""),
+        help="Optional account id/name used by MCP Gmail tools that require explicit account parameter",
+    )
+    parser.add_argument(
+        "--mcp-startup-timeout",
+        type=int,
+        default=int(_env_value("MCP_STARTUP_TIMEOUT", "mcp_startup_timeout", default="20")),
+        help="Seconds to wait for MCP server startup and initialize",
+    )
+    parser.add_argument(
+        "--mcp-request-timeout",
+        type=int,
+        default=int(_env_value("MCP_REQUEST_TIMEOUT", "mcp_request_timeout", default="45")),
+        help="Seconds to wait for each MCP request",
+    )
     parser.add_argument("--json-output", action="store_true")
     return parser.parse_args()
 
@@ -315,21 +329,20 @@ def _build_retriever_paths(args: argparse.Namespace) -> list[str]:
 
 
 def _sync_email_window(args: argparse.Namespace, *, offset: int, append: bool) -> dict[str, Any]:
-    summary = sync_gmail_to_jsonl(
-        gmail_user=str(args.gmail_user),
-        gmail_password=str(args.gmail_password),
-        imap_host=str(args.imap_host),
-        imap_port=int(args.imap_port),
+    return sync_gmail_via_mcp(
+        mcp_server_command=str(args.mcp_server_command),
+        search_tool_name=str(args.mcp_search_tool),
+        mcp_account=str(args.mcp_account),
         mailbox=str(args.mailbox),
         search_criterion=str(args.search_criterion),
         max_emails=int(args.sync_batch_size),
         max_body_chars=int(args.sync_max_body_chars),
         output_jsonl=str(args.email_chunks),
-        include_html_fallback=bool(args.sync_include_html_fallback),
         offset=offset,
         append=append,
+        startup_timeout_s=int(args.mcp_startup_timeout),
+        request_timeout_s=int(args.mcp_request_timeout),
     )
-    return summary
 
 
 def _load_retriever_and_rows(args: argparse.Namespace) -> tuple[TfidfRagRetriever, list[dict[str, Any]]]:
@@ -757,37 +770,24 @@ def _build_email_message_text(
     return "\n".join(lines).strip()
 
 
-def _send_email_via_smtp(
+def _send_email_via_transport(
     *,
-    smtp_host: str,
-    smtp_port: int,
-    smtp_user: str,
-    smtp_password: str,
-    send_from: str,
+    args: argparse.Namespace,
     send_to: str,
     subject: str,
     body: str,
-    dry_run: bool = False,
 ) -> str:
-    if not EMAIL_REGEX.fullmatch(send_to):
-        raise ValueError(f"Invalid recipient email: {send_to}")
-    if not smtp_user or not smtp_password:
-        raise ValueError("Missing SMTP credentials. Set --smtp-user/--smtp-password or env vars.")
-
-    from_addr = send_from or smtp_user
-    msg = EmailMessage()
-    msg["From"] = from_addr
-    msg["To"] = send_to
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    if dry_run:
-        return f"[dry-run] Email prepared for {send_to} with subject '{subject}'."
-
-    with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
-        server.login(smtp_user, smtp_password)
-        server.send_message(msg)
-    return f"Email sent to {send_to} with subject '{subject}'."
+    return send_email_via_mcp(
+        mcp_server_command=str(args.mcp_server_command),
+        send_tool_name=str(args.mcp_send_tool),
+        mcp_account=str(args.mcp_account),
+        send_to=send_to,
+        subject=subject,
+        body=body,
+        dry_run=bool(args.send_dry_run),
+        startup_timeout_s=int(args.mcp_startup_timeout),
+        request_timeout_s=int(args.mcp_request_timeout),
+    )
 
 
 def _print_result(result: dict[str, Any]) -> None:
@@ -835,16 +835,11 @@ def _send_from_result(
         evidence=result.get("evidence", []) if isinstance(result.get("evidence", []), list) else [],
         instruction=instruction,
     )
-    return _send_email_via_smtp(
-        smtp_host=args.smtp_host,
-        smtp_port=args.smtp_port,
-        smtp_user=str(args.smtp_user).strip(),
-        smtp_password=str(args.smtp_password).strip(),
-        send_from=str(args.send_from).strip(),
+    return _send_email_via_transport(
+        args=args,
         send_to=recipient,
         subject=subject,
         body=body,
-        dry_run=bool(args.send_dry_run),
     )
 
 
@@ -1224,6 +1219,8 @@ def main() -> None:
 
     if int(args.sync_batch_size) <= 0:
         raise ValueError("--sync-batch-size must be greater than 0")
+    if not str(args.mcp_server_command).strip():
+        raise ValueError("Missing --mcp-server-command (MCP-only runtime).")
 
     prompt_artifact_path = _resolve_prompt_artifact_path(args.prompt_artifact)
     prompt_artifact, prompt_source = _load_prompt_artifact(prompt_artifact_path)
@@ -1390,16 +1387,11 @@ def main() -> None:
 
             subject = str(action_plan.get("email_subject", "")).strip() or "Message from Local Gmail Assistant"
             try:
-                send_status = _send_email_via_smtp(
-                    smtp_host=args.smtp_host,
-                    smtp_port=args.smtp_port,
-                    smtp_user=str(args.smtp_user).strip(),
-                    smtp_password=str(args.smtp_password).strip(),
-                    send_from=str(args.send_from).strip(),
+                send_status = _send_email_via_transport(
+                    args=args,
                     send_to=recipient,
                     subject=subject,
                     body=body,
-                    dry_run=bool(args.send_dry_run),
                 )
             except Exception as exc:
                 error_message = f"Send failed: {exc}"

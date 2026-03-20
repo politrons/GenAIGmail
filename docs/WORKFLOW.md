@@ -5,7 +5,7 @@ This document describes the core runtime flow of the local Gmail assistant.
 ## 1. Entry Point
 
 1. The launcher starts with:
-   - `python3 main.py run -- ...`
+   - `python3 main.py run -- --mcp-server-command "npx -y google-workspace-mcp serve" --mcp-account "<account>"`
 2. `main.py` forwards execution to:
    - `src.email_local_assistant.ask_email`
 
@@ -21,13 +21,8 @@ This document describes the core runtime flow of the local Gmail assistant.
 
 1. If `data/gmail_chunks.jsonl` does not exist or is empty, runtime triggers sync:
    - `_sync_email_window(...)`
-2. `_sync_email_window(...)` calls `sync_gmail_to_jsonl(...)` from `gmail_sync.py`.
-3. `sync_gmail_to_jsonl(...)`:
-   - Authenticates via IMAP
-   - Searches mailbox with configured criterion
-   - Fetches a paged batch of emails
-   - Extracts metadata/body
-   - Writes normalized JSONL chunks locally
+2. `_sync_email_window(...)` calls `sync_gmail_via_mcp(...)`.
+3. MCP backend writes normalized JSONL chunks locally for retrieval.
 
 ## 4. Retriever Build (RAG)
 
@@ -76,7 +71,8 @@ When action is `search`:
    - Sends based on the last search result candidate.
 2. `compose_send`:
    - Sends a newly composed email using recipient + subject + body from action plan.
-3. Actual send is executed by `_send_email_via_smtp(...)`.
+3. Actual send is executed by MCP tool call.
+   - With `google-workspace-mcp` defaults, send flow is `createGmailDraft` -> `sendGmailDraft`.
 
 ## 9. Design Principle
 
@@ -87,4 +83,4 @@ Search behavior is LLM-first:
    - Email sync
    - Index/retrieval
    - Prompt assembly
-   - SMTP delivery
+   - MCP tool delivery
